@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 DREAM x CACHE Target 2035 Drug Discovery Challenge
-Unified Model Inference & Validation/Submission Pipeline.
+Unified Model Inference & Validation/Submission Pipeline (MMELON late-fusion version).
 
-This script allows your collaborator to load a fine-tuned MAMMAL model,
+This script allows your collaborator to load our fine-tuned MMELON prediction head,
 run inference on the CACHE validation/test splits, select the top 50 chemically 
 diverse candidates, and generate the exact submission files required by the challenge:
 1. Validation Split: A .txt file with exactly 50 CatalogIDs (one per line).
@@ -22,13 +22,9 @@ from functools import partial
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-
-from fuse.data.tokenizers.modular_tokenizer.op import ModularTokenizerOp
-from fuse.data.utils.collates import CollateDefault
-from mammal.model import Mammal
-from mammal.keys import ENCODER_INPUTS_STR, ENCODER_INPUTS_TOKENS, ENCODER_INPUTS_ATTENTION_MASK, SCORES
 
 # Import official evaluation helper if available
 sys.path.append(str(Path(__file__).parent / "Target2035_Aircheck_Utils" / "EvaluationCode"))
@@ -38,7 +34,8 @@ try:
 except ImportError:
     EVALUATION_AVAILABLE = False
 
-from preprocess_del import load_pgk2_sequence, construct_mammal_prompt, BuildingBlockMapper
+from preprocess_del import BuildingBlockMapper, extract_smiles_embedding
+from run_pipeline import MMELONCombinatorialMLP
 
 # ---------------------------------------------------------------------------
 # 1. Dataset for Validation / Inference (No Training Labels Required)
@@ -46,23 +43,22 @@ from preprocess_del import load_pgk2_sequence, construct_mammal_prompt, Building
 
 class InferenceDataset(Dataset):
     """
-    Dataset representing the validation or test compounds for MAMMAL inference.
-    Maps molecular structures alongside CatalogIDs and target protein sequences.
+    Dataset representing the validation or test compounds for MMELON inference.
+    Maps molecular structures alongside CatalogIDs and computes multi-view embeddings.
     """
     def __init__(
         self,
         filepath: str,
-        protein_sequence: str,
-        tokenizer_op: ModularTokenizerOp,
         bb_mapper: BuildingBlockMapper | None = None,
-        compact: bool = False,
+        bb_embeddings_path: str | None = None,
+        base_model_path: str = "ibm-research/biomed.sm.mv-te-84m",
+        reverse_engineer: bool = False,
         id_column: str = "CatalogID",
         smiles_column: str = "SMILES",
+        device: str = "cpu"
     ) -> None:
-        self.tokenizer_op = tokenizer_op
-        self.protein_sequence = protein_sequence
         self.bb_mapper = bb_mapper
-        self.compact = compact
+        self.reverse_engineer = reverse_engineer
         
         # Load CSV or Parquet
         ext = Path(filepath).suffix.lower()
@@ -81,107 +77,43 @@ class InferenceDataset(Dataset):
         self.smiles = self.df[self.smiles_column].tolist()
         
         print(f"Loaded {len(self.smiles):,} compounds for inference from '{filepath}'.")
-        if self.compact and self.bb_mapper is not None:
-            print("✔ Compact combinatorial mode active. Validation SMILES will be reverse-engineered to library building blocks.")
+        
+        if self.reverse_engineer and self.bb_mapper is not None and bb_embeddings_path is not None:
+            print("✔ Reverse-Engineering validation SMILES to library building blocks...")
+            self.bb_embeddings = dict(np.load(bb_embeddings_path))
+            self.emb_dim = next(iter(self.bb_embeddings.values())).shape[0]
+            
+            # Reconstruct embeddings combinatorially
+            embeddings_list = []
+            for sm in tqdm(self.smiles, desc="Reverse Engineering SMILES"):
+                _, bb_codes = self.bb_mapper.reverse_engineer_smiles(sm)
+                bb_vecs = []
+                for bb_id in bb_codes:
+                    if bb_id in self.bb_embeddings:
+                        bb_vecs.append(self.bb_embeddings[bb_id])
+                    else:
+                        bb_vecs.append(np.zeros(self.emb_dim, dtype=np.float32))
+                embeddings_list.append(np.mean(bb_vecs, axis=0))
+            self.embeddings = np.array(embeddings_list, dtype=np.float32)
+        else:
+            print("✔ Direct Embedding Mode active. Extracting multi-view embeddings directly using pre-trained MMELON model...")
+            self.embeddings = extract_smiles_embedding(
+                smiles_list=self.smiles,
+                base_model_path=base_model_path,
+                device=device
+            )
+            
+        self.emb_dim = self.embeddings.shape[1]
 
     def __len__(self) -> int:
         return len(self.smiles)
 
-    def __getitem__(self, idx: int) -> dict:
-        compound_id = self.ids[idx]
-        compound_smiles = self.smiles[idx]
-        
-        # If compact/combinatorial mode and a bb_mapper is provided, we reverse engineer the building blocks!
-        if self.compact and self.bb_mapper is not None:
-            # Reverse engineer the SMILES into building blocks
-            bb_smiles, bb_codes = self.bb_mapper.reverse_engineer_smiles(compound_smiles)
-        else:
-            bb_smiles = []
-            bb_codes = None
-            
-        prompt_str = construct_mammal_prompt(
-            protein_sequence=self.protein_sequence,
-            bb_smiles=bb_smiles,
-            compound_smiles=compound_smiles,
-            bb_codes=bb_codes,
-            compact=self.compact
-        )
-        
-        sample_dict = {
-            "data.sample_id": compound_id,
-            "data.smiles": compound_smiles,
-            ENCODER_INPUTS_STR: prompt_str
-        }
-        
-        self.tokenizer_op(
-            sample_dict=sample_dict,
-            key_in=ENCODER_INPUTS_STR,
-            key_out_tokens_ids=ENCODER_INPUTS_TOKENS,
-            key_out_attention_mask=ENCODER_INPUTS_ATTENTION_MASK,
-            max_seq_len=512,
-        )
-        
-        for k in (ENCODER_INPUTS_TOKENS, ENCODER_INPUTS_ATTENTION_MASK):
-            sample_dict[k] = torch.tensor(sample_dict[k])
-            
-        return sample_dict
+    def __getitem__(self, idx: int) -> tuple[str, str, torch.Tensor]:
+        compound_id = str(self.ids[idx])
+        compound_smiles = str(self.smiles[idx])
+        emb = self.embeddings[idx]
+        return compound_id, compound_smiles, torch.tensor(emb, dtype=torch.float32)
 
-
-def run_mammal_inference(
-    model: Mammal,
-    dataloader: DataLoader,
-    tokenizer_op: ModularTokenizerOp,
-    device: str = "cpu",
-    classification_position: int = 1,
-) -> pd.DataFrame:
-    """Run model feedforward and extract the probabilities of the active class token '<1>'."""
-    model.eval()
-    model = model.to(device)
-
-    neg_token_id = tokenizer_op.get_token_id("<0>")
-    pos_token_id = tokenizer_op.get_token_id("<1>")
-
-    results = {
-        "CatalogID": [],
-        "SMILES": [],
-        "Score": []
-    }
-    
-    print(f"Running inference on device: {device}...")
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Predicting Binders"):
-            batch_size = batch[ENCODER_INPUTS_TOKENS].shape[0]
-
-            for k in (ENCODER_INPUTS_TOKENS, ENCODER_INPUTS_ATTENTION_MASK):
-                batch[k] = batch[k].to(device)
-                
-            batch_out = model.generate(
-                batch,
-                output_scores=True,
-                return_dict_in_generate=True,
-                max_new_tokens=5,
-            )
-
-            decoder_scores = batch_out[SCORES]  # Dimensions: (B, seq_len, vocab_size)
-            
-            for i in range(batch_size):
-                compound_id = batch["data.sample_id"][i]
-                smiles = batch["data.smiles"][i]
-                
-                # Fetch raw prediction logits at the target token position
-                decoder_logits = decoder_scores[i].cpu().numpy()  # (seq_len, vocab_size)
-                
-                neg_logit = decoder_logits[classification_position, neg_token_id]
-                pos_logit = decoder_logits[classification_position, pos_token_id]
-                
-                # Softmax normalization over the binary decision labels
-                score = pos_logit / (pos_logit + neg_logit + 1e-8)
-                
-                results["CatalogID"].append(compound_id)
-                results["SMILES"].append(smiles)
-                results["Score"].append(score)
-
-    return pd.DataFrame(results)
 
 # ---------------------------------------------------------------------------
 # 2. Main CLI Controller
@@ -189,16 +121,16 @@ def run_mammal_inference(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="DREAM x CACHE Target 2035: Model Inference, Evaluation, & Submission Pipeline CLI",
+        description="DREAM x CACHE Target 2035: Model Inference, Evaluation, & Submission Pipeline CLI (MMELON)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
     # Model and Inputs
     parser.add_argument(
-        "--model-dir",
+        "--model-file",
         type=str,
-        required=True,
-        help="Path to the directory containing the fine-tuned MAMMAL checkpoint and saved tokenizer."
+        default="processed_data/mmelon_mlp_head.pt",
+        help="Path to the trained MMELON MLP head weights file."
     )
     parser.add_argument(
         "--validation-file",
@@ -207,27 +139,29 @@ def parse_args() -> argparse.Namespace:
         help="Path to the validation or test split CSV/Parquet (e.g. PGK2_CACHE_Val_Test_Set.csv)."
     )
     parser.add_argument(
-        "--fasta-file",
-        type=str,
-        default="pgk2_sequence.fasta",
-        help="Path to the PGK2 FASTA protein sequence."
-    )
-    parser.add_argument(
         "--output-dir",
         type=str,
         default="submissions",
         help="Directory where submission outputs (.txt and .csv files) will be saved."
     )
+    
+    # Combinatorial / Reverse Engineering Options (Optional)
     parser.add_argument(
-        "--compact",
+        "--reverse-engineer",
         action="store_true",
-        help="Use a compact combinatorial prompt style by reverse-engineering validation SMILES to library building blocks."
+        help="Whether to reverse-engineer full validation SMILES to library building blocks instead of direct embedding."
+    )
+    parser.add_argument(
+        "--bb-embeddings",
+        type=str,
+        default="processed_data/mmelon_bb_embeddings.npz",
+        help="Path to the precomputed building block embeddings cache."
     )
     parser.add_argument(
         "--bb-glob",
         type=str,
         default="OpenDEL-libraries/building_blocks/*.parquet",
-        help="Glob pattern pointing to the building block parquet files (required if --compact is active)."
+        help="Glob pattern pointing to physical library building block files."
     )
     
     # Options
@@ -249,12 +183,6 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Inference batch size."
     )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="DataLoader num workers."
-    )
     
     # Optional Ground Truth Evaluation
     parser.add_argument(
@@ -271,7 +199,7 @@ def main() -> None:
     args = parse_args()
     
     print("=" * 60)
-    print("   DREAM x CACHE TARGET 2035 - VALIDATION & INFERENCE CLI")
+    print("   DREAM x CACHE TARGET 2035 - VALIDATION & INFERENCE CLI (MMELON)")
     print("=" * 60)
     
     os.makedirs(args.output_dir, exist_ok=True)
@@ -280,74 +208,76 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Hardware accelerator: {device.upper()}")
     
-    # 1. Load fine-tuned model and saved tokenizer from model_dir
-    print(f"\nLoading fine-tuned model from '{args.model_dir}'...")
+    # 1. Load fine-tuned prediction head
+    print(f"\nLoading fine-tuned prediction head from '{args.model_file}'...")
     try:
-        model = Mammal.from_pretrained(args.model_dir)
-        tokenizer_op = ModularTokenizerOp.from_pretrained(args.model_dir)
-        print("✔ Fine-tuned model and tokenizer successfully loaded.")
+        ckpt = torch.load(args.model_file, map_location=device)
+        input_dim = ckpt["input_dim"]
+        base_model = ckpt.get("base_model", "ibm-research/biomed.sm.mv-te-84m")
+        
+        mlp_head = MMELONCombinatorialMLP(input_dim=input_dim)
+        mlp_head.load_state_dict(ckpt["state_dict"])
+        mlp_head = mlp_head.to(device)
+        mlp_head.eval()
+        print("✔ Fine-tuned prediction head successfully loaded.")
     except Exception as e:
         print(f"❌ Error loading model: {e}")
-        print("Please ensure --model-dir points to a valid checkpoint containing config.json and tokenizer directory.")
+        print("Please ensure --model-file points to a valid .pt checkpoint containing the MLP state dict.")
         return
         
-    # 2. Get PGK2 Sequence Context
-    pgk2_sequence = load_pgk2_sequence(args.fasta_file)
-    print(f"✔ Loaded PGK2 sequence context.")
-    
-    # Load BuildingBlockMapper if compact mode is selected
+    # Load BuildingBlockMapper if reverse-engineering is selected
     bb_mapper = None
-    if args.compact:
-        print(f"\nLoading building blocks for reverse engineering from '{args.bb_glob}'...")
+    if args.reverse_engineer:
         bb_mapper = BuildingBlockMapper(bb_files_glob=args.bb_glob)
         if len(bb_mapper.bb_map) == 0:
-            print("⚠️ Warning: No building blocks mapped for reverse-engineering. Ensure --bb-glob is correct.")
-        else:
-            print(f"✔ Successfully loaded {len(bb_mapper.bb_map):,} building blocks for reverse engineering.")
+            print("⚠️ Warning: No building blocks mapped. Direct Embedding mode is highly recommended instead.")
+            args.reverse_engineer = False
             
-    # 3. Create Dataset and DataLoader
+    # 2. Create Dataset and DataLoader
     try:
         dataset = InferenceDataset(
             filepath=args.validation_file,
-            protein_sequence=pgk2_sequence,
-            tokenizer_op=tokenizer_op,
             bb_mapper=bb_mapper,
-            compact=args.compact,
+            bb_embeddings_path=args.bb_embeddings,
+            base_model_path=base_model,
+            reverse_engineer=args.reverse_engineer,
             id_column=args.id_col,
-            smiles_column=args.smiles_col
+            smiles_column=args.smiles_col,
+            device=device
         )
-        
-        # Setup padding crop optimization
-        pad_id = tokenizer_op.get_token_id("<PAD>")
-        special_handlers = {
-            ENCODER_INPUTS_TOKENS: partial(CollateDefault.crop_padding, pad_token_id=pad_id),
-            ENCODER_INPUTS_ATTENTION_MASK: partial(CollateDefault.crop_padding, pad_token_id=False),
-        }
         
         dataloader = DataLoader(
             dataset=dataset,
             batch_size=args.batch_size,
-            collate_fn=CollateDefault(special_handlers_keys=special_handlers),
-            shuffle=False,
-            num_workers=args.num_workers,
+            shuffle=False
         )
     except Exception as e:
         print(f"❌ Error preparing dataloader: {e}")
         return
         
-    # 4. Run Model Prediction
+    # 3. Run Prediction
     print("\nRunning inference engine...")
-    pred_df = run_mammal_inference(
-        model=model,
-        dataloader=dataloader,
-        tokenizer_op=tokenizer_op,
-        device=device
-    )
+    results = {
+        "CatalogID": [],
+        "SMILES": [],
+        "Score": []
+    }
     
-    # 5. Format & Save Challenge Submission Outputs
+    with torch.no_grad():
+        for comp_ids, smiles, embs in tqdm(dataloader, desc="Predicting Binders"):
+            embs = embs.to(device)
+            logits = mlp_head(embs).squeeze(-1)
+            scores = torch.sigmoid(logits).cpu().numpy()
+            
+            for i in range(len(comp_ids)):
+                results["CatalogID"].append(comp_ids[i])
+                results["SMILES"].append(smiles[i])
+                results["Score"].append(float(scores[i]))
+                
+    pred_df = pd.DataFrame(results)
+    
+    # 4. Format & Save Challenge Submission Outputs
     print("\nFormatting submission files...")
-    
-    # Sort descending by prediction score
     ranked_df = pred_df.sort_values(by="Score", ascending=False).reset_index(drop=True)
     
     # Identify top 50 candidate binders (flag Sel_50 as 1, others as 0)
@@ -355,8 +285,8 @@ def main() -> None:
     ranked_df.loc[:49, "Sel_50"] = 1
     
     # Output file paths
-    val_txt_path = os.path.join(args.output_dir, "Team_MAMMAL_submission_validation.txt")
-    test_csv_path = os.path.join(args.output_dir, "Team_MAMMAL_submission_test.csv")
+    val_txt_path = os.path.join(args.output_dir, "Team_MMELON_submission_validation.txt")
+    test_csv_path = os.path.join(args.output_dir, "Team_MMELON_submission_test.csv")
     
     # Save validation split file (.txt containing exactly 50 CatalogIDs, one per line)
     top_50_ids = ranked_df.loc[ranked_df["Sel_50"] == 1, "CatalogID"]
@@ -371,7 +301,7 @@ def main() -> None:
     print(f"✔ Test-split (.csv) submission saved to:       {test_csv_path}")
     print("-" * 50)
     
-    # 6. Run Local Performance Evaluation (If labels are available)
+    # 5. Run Local Performance Evaluation (If labels are available)
     if args.gold_file is not None:
         if not EVALUATION_AVAILABLE:
             print("⚠️ Local evaluation skipped: official evaluation script not found in Target2035_Aircheck_Utils.")

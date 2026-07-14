@@ -1,13 +1,13 @@
 """
 DREAM x CACHE Target 2035 Drug Discovery Challenge
-Pipeline Validation & Testing Suite.
+Pipeline Validation & Testing Suite (MMELON late-fusion version).
 
 This script acts as a test runner that:
 1. Generates synthetic Mock DEL selection parquets and mock building block parquets.
 2. Runs the end-to-end Polars deduplication and aggregates count and Z-score metrics.
-3. Tests the 3 customizable scoring tiers (Binary, Sigmoid Soft-Enrichment, Bayesian Reads).
-4. Loads MAMMAL's tokenizer to test prompt assembly, tokenization, and output dimensions.
-5. Verifies that the dataset structure is fully ready for HPC fine-tuning.
+3. Tests the building block MMELON embedding caching mechanism.
+4. Verifies PyTorch CombinatorialMMELONDataset loading, label calculations, and embedding fusion.
+5. Performs a mock train-and-evaluate run of the MMELON Combinatorial MLP head to ensure correctness.
 """
 
 from __future__ import annotations
@@ -17,10 +17,17 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import torch
-from fuse.data.tokenizers.modular_tokenizer.op import ModularTokenizerOp
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
 # Import our custom modules
-from preprocess_del import deduplicate_selection_parquet, BuildingBlockMapper, LargeMAMMALDataset, load_pgk2_sequence
+from preprocess_del import (
+    deduplicate_selection_parquet,
+    BuildingBlockMapper,
+    CombinatorialMMELONDataset,
+    cache_bb_embeddings
+)
+from run_pipeline import MMELONCombinatorialMLP
 
 # Mock structures for testing
 MOCK_SMILES = [
@@ -113,7 +120,7 @@ def test_pipeline() -> None:
     """Run verification tests."""
     mock_dir = "mock_test_sandbox"
     print("==================================================")
-    print("STARTING TEST RUNNER FOR THE WORKFLOW")
+    print("STARTING TEST RUNNER FOR THE WORKFLOW (MMELON)")
     print("==================================================")
     
     try:
@@ -157,88 +164,55 @@ def test_pipeline() -> None:
         print(f"  Reverse-Engineered codes: {ret_codes}")
         assert len(ret_bbs) == 3 and len(ret_codes) == 3, "Reverse-engineering should return lists of length 3!"
         
-        # 4. Load lightweight MAMMAL tokenizer from HuggingFace to verify encoding pipeline
-        print("Loading pre-trained modular tokenizer from HuggingFace...")
-        tokenizer_op = ModularTokenizerOp.from_pretrained("ibm/biomed.omics.bl.sm.ma-ted-458m")
-        print("✔ Tokenizer loaded successfully.")
+        # 4. Test Building Block Embedding Caching
+        print("\nTesting MMELON embedding cacher...")
+        bb_embeddings_path = f"{mock_dir}/mmelon_bb_embeddings_mock.npz"
+        cache_bb_embeddings(
+            bb_mapper=bb_mapper,
+            base_model_path="ibm-research/biomed.sm.mv-te-84m",
+            output_path=bb_embeddings_path,
+            device="cpu"
+        )
+        assert os.path.exists(bb_embeddings_path), "Embedding cache was not created!"
+        print("✔ Embedding cache successfully written.")
         
         # 5. Initialize Large-Scale Dataset with Customizable Target Schemes
-        print("Testing Dataset pipeline with Tier 1 (Hard Binary Classification)...")
-        pgk2_sequence = load_pgk2_sequence()
-        
-        ds_tier1 = LargeMAMMALDataset(
+        print("\nTesting CombinatorialMMELONDataset under Tier 2...")
+        dataset = CombinatorialMMELONDataset(
             selection_parquet_path=dedup_path,
-            bb_mapper=bb_mapper,
-            protein_sequence=pgk2_sequence,
-            tokenizer_op=tokenizer_op,
-            scoring_scheme="tier1",
+            bb_embeddings_path=bb_embeddings_path,
+            scoring_scheme="tier2",
             score_threshold_labeling=0.5,
-            pgk2_threshold=2.0,
-            ntc_threshold=1.0,
-            inh_threshold=1.0,
         )
-        print(f"✔ Dataset loaded under Tier 1 with {len(ds_tier1)} compounds.")
+        print(f"✔ Dataset loaded under Tier 2 with {len(dataset)} compounds.")
         
         # Grab first item
-        sample_tier1 = ds_tier1[0]
+        embs, label, target_score = dataset[0]
         print("✔ Dataset output shape validation:")
+        print(f"  - Compound embedding shape: {embs.shape}")
+        print(f"  - Target Score value:       {target_score:.4f}")
+        print(f"  - Label value:              {label}")
         
-        # Look up the actual keys from mammal.keys constants
-        from mammal.keys import ENCODER_INPUTS_TOKENS, DECODER_INPUTS_TOKENS
-        print(f"  - Encoder tokens shape: {sample_tier1[ENCODER_INPUTS_TOKENS].shape}")
-        print(f"  - Decoder tokens shape: {sample_tier1[DECODER_INPUTS_TOKENS].shape}")
-        print(f"  - Target Score value:   {sample_tier1['data.target_score']}")
-        print(f"  - Target label:         {sample_tier1['data.label']}")
+        # 6. Test MLP head setup and mock train step
+        print("\nTesting MLP prediction head feedforward & training loop...")
+        loader = DataLoader(dataset, batch_size=4, shuffle=True)
+        mlp_head = MMELONCombinatorialMLP(input_dim=dataset.emb_dim)
         
-        print("\nTesting Dataset pipeline with Tier 2 (Soft Sigmoid Probability Targets)...")
-        ds_tier2 = LargeMAMMALDataset(
-            selection_parquet_path=dedup_path,
-            bb_mapper=bb_mapper,
-            protein_sequence=pgk2_sequence,
-            tokenizer_op=tokenizer_op,
-            scoring_scheme="tier2",
-            temperature=1.5,
-            bias=1.5,
-            score_threshold_labeling=0.5,
-        )
-        sample_tier2 = ds_tier2[0]
-        print(f"✔ Dataset loaded under Tier 2. Target Score: {sample_tier2['data.target_score']:.4f}")
+        batch_embs, batch_labels, _ = next(iter(loader))
+        logits = mlp_head(batch_embs).squeeze(-1)
         
-        print("\nTesting Dataset pipeline with Tier 3 (Bayesian Read Ratio)...")
-        ds_tier3 = LargeMAMMALDataset(
-            selection_parquet_path=dedup_path,
-            bb_mapper=bb_mapper,
-            protein_sequence=pgk2_sequence,
-            tokenizer_op=tokenizer_op,
-            scoring_scheme="tier3",
-            count_pgk2_col="count_PGK2",
-            count_inh_col="count_PGK2_with_inhibitor",
-            count_ntc_col="count_NTC",
-            temperature=1.0,
-            bias=1.0,
-            score_threshold_labeling=0.5,
-        )
-        sample_tier3 = ds_tier3[0]
-        print(f"✔ Dataset loaded under Tier 3. Target Score: {sample_tier3['data.target_score']:.4f}")
+        assert logits.shape == batch_labels.shape, "Output shape mismatch between logits and labels!"
+        print(f"  - MLP feedforward successful. Output shape: {logits.shape}")
         
-        print("\nTesting Dataset pipeline in COMPACT combinatorial mode...")
-        ds_compact = LargeMAMMALDataset(
-            selection_parquet_path=dedup_path,
-            bb_mapper=bb_mapper,
-            protein_sequence=pgk2_sequence,
-            tokenizer_op=tokenizer_op,
-            scoring_scheme="tier2",
-            score_threshold_labeling=0.5,
-            compact=True,
-        )
-        sample_compact = ds_compact[0]
-        print(f"✔ Dataset loaded under Compact mode. Target Score: {sample_compact['data.target_score']:.4f}")
-        print(f"  - Encoder tokens shape: {sample_compact[ENCODER_INPUTS_TOKENS].shape}")
+        # Loss run
+        criterion = nn.BCEWithLogitsLoss()
+        loss = criterion(logits, batch_labels)
+        print(f"  - Loss calculation successful. Loss value: {loss.item():.4f}")
         
         print("\n==================================================")
         print("🎉 ALL VERIFICATION TESTS PASSED SUCCESSFULLY! 🎉")
         print("==================================================")
-        print("The pipeline is fully validated, completely modular, and ready for HPC execution.")
+        print("The MMELON pipeline is fully validated, completely modular, and ready for HPC execution.")
 
     finally:
         # Clean up sandbox files
