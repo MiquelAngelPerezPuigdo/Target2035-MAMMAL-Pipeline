@@ -148,6 +148,15 @@ def test_pipeline() -> None:
         print(f"  Mapped BB3: {bbs[2][:30]}...")
         assert len(bbs) == 3 and all(isinstance(s, str) for s in bbs), "BB mapping failed!"
         
+        # Test reverse-engineering of validation SMILES to BB speaking
+        print("Testing BuildingBlockMapper reverse-engineering of SMILES...")
+        query_smiles = MOCK_SMILES[0] # Imatinib
+        ret_bbs, ret_codes = bb_mapper.reverse_engineer_smiles(query_smiles)
+        print(f"  Query SMILES: {query_smiles[:30]}...")
+        print(f"  Reverse-Engineered BBs: {ret_bbs}")
+        print(f"  Reverse-Engineered codes: {ret_codes}")
+        assert len(ret_bbs) == 3 and len(ret_codes) == 3, "Reverse-engineering should return lists of length 3!"
+        
         # 4. Load lightweight MAMMAL tokenizer from HuggingFace to verify encoding pipeline
         print("Loading pre-trained modular tokenizer from HuggingFace...")
         tokenizer_op = ModularTokenizerOp.from_pretrained("ibm/biomed.omics.bl.sm.ma-ted-458m")
@@ -211,6 +220,20 @@ def test_pipeline() -> None:
         )
         sample_tier3 = ds_tier3[0]
         print(f"✔ Dataset loaded under Tier 3. Target Score: {sample_tier3['data.target_score']:.4f}")
+        
+        print("\nTesting Dataset pipeline in COMPACT combinatorial mode...")
+        ds_compact = LargeMAMMALDataset(
+            selection_parquet_path=dedup_path,
+            bb_mapper=bb_mapper,
+            protein_sequence=pgk2_sequence,
+            tokenizer_op=tokenizer_op,
+            scoring_scheme="tier2",
+            score_threshold_labeling=0.5,
+            compact=True,
+        )
+        sample_compact = ds_compact[0]
+        print(f"✔ Dataset loaded under Compact mode. Target Score: {sample_compact['data.target_score']:.4f}")
+        print(f"  - Encoder tokens shape: {sample_compact[ENCODER_INPUTS_TOKENS].shape}")
         
         print("\n==================================================")
         print("🎉 ALL VERIFICATION TESTS PASSED SUCCESSFULLY! 🎉")

@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
         default="ibm/biomed.omics.bl.sm.ma-ted-458m",
         help="HuggingFace repository ID for MAMMAL to load tokenizer."
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Use a compact combinatorial prompt style by feeding protein sequence and BB SMILES once, then using BB codes."
+    )
     
     return parser.parse_args()
 
@@ -136,7 +141,7 @@ def main() -> None:
         
     sample_limit = args.sample_size if args.sample_size > 0 else None
     
-    print(f"Initializing LargeMAMMALDataset (Scheme: {args.scoring_scheme}, Sample Limit: {sample_limit})...")
+    print(f"Initializing LargeMAMMALDataset (Scheme: {args.scoring_scheme}, Sample Limit: {sample_limit}, Compact: {args.compact})...")
     try:
         dataset = LargeMAMMALDataset(
             selection_parquet_path=dedup_output_path,
@@ -146,6 +151,7 @@ def main() -> None:
             scoring_scheme=args.scoring_scheme,
             score_threshold_labeling=args.score_threshold,
             sample_size=sample_limit,
+            compact=args.compact,
         )
         print("✔ Dataset loaded successfully.")
         

@@ -38,7 +38,7 @@ try:
 except ImportError:
     EVALUATION_AVAILABLE = False
 
-from preprocess_del import load_pgk2_sequence, construct_mammal_prompt
+from preprocess_del import load_pgk2_sequence, construct_mammal_prompt, BuildingBlockMapper
 
 # ---------------------------------------------------------------------------
 # 1. Dataset for Validation / Inference (No Training Labels Required)
@@ -54,11 +54,15 @@ class InferenceDataset(Dataset):
         filepath: str,
         protein_sequence: str,
         tokenizer_op: ModularTokenizerOp,
+        bb_mapper: BuildingBlockMapper | None = None,
+        compact: bool = False,
         id_column: str = "CatalogID",
         smiles_column: str = "SMILES",
     ) -> None:
         self.tokenizer_op = tokenizer_op
         self.protein_sequence = protein_sequence
+        self.bb_mapper = bb_mapper
+        self.compact = compact
         
         # Load CSV or Parquet
         ext = Path(filepath).suffix.lower()
@@ -77,6 +81,8 @@ class InferenceDataset(Dataset):
         self.smiles = self.df[self.smiles_column].tolist()
         
         print(f"Loaded {len(self.smiles):,} compounds for inference from '{filepath}'.")
+        if self.compact and self.bb_mapper is not None:
+            print("✔ Compact combinatorial mode active. Validation SMILES will be reverse-engineered to library building blocks.")
 
     def __len__(self) -> int:
         return len(self.smiles)
@@ -85,12 +91,20 @@ class InferenceDataset(Dataset):
         compound_id = self.ids[idx]
         compound_smiles = self.smiles[idx]
         
-        # Combinatorial structure parsing is skipped here as ASMS compounds are fully synthesized,
-        # single-molecule screenings. Hence, we prompt the target protein sequence and the single molecule smiles.
+        # If compact/combinatorial mode and a bb_mapper is provided, we reverse engineer the building blocks!
+        if self.compact and self.bb_mapper is not None:
+            # Reverse engineer the SMILES into building blocks
+            bb_smiles, bb_codes = self.bb_mapper.reverse_engineer_smiles(compound_smiles)
+        else:
+            bb_smiles = []
+            bb_codes = None
+            
         prompt_str = construct_mammal_prompt(
             protein_sequence=self.protein_sequence,
-            bb_smiles=[],  # No separate combinatorial building blocks for validation set
-            compound_smiles=compound_smiles
+            bb_smiles=bb_smiles,
+            compound_smiles=compound_smiles,
+            bb_codes=bb_codes,
+            compact=self.compact
         )
         
         sample_dict = {
@@ -204,6 +218,17 @@ def parse_args() -> argparse.Namespace:
         default="submissions",
         help="Directory where submission outputs (.txt and .csv files) will be saved."
     )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Use a compact combinatorial prompt style by reverse-engineering validation SMILES to library building blocks."
+    )
+    parser.add_argument(
+        "--bb-glob",
+        type=str,
+        default="OpenDEL-libraries/building_blocks/*.parquet",
+        help="Glob pattern pointing to the building block parquet files (required if --compact is active)."
+    )
     
     # Options
     parser.add_argument(
@@ -270,12 +295,24 @@ def main() -> None:
     pgk2_sequence = load_pgk2_sequence(args.fasta_file)
     print(f"✔ Loaded PGK2 sequence context.")
     
+    # Load BuildingBlockMapper if compact mode is selected
+    bb_mapper = None
+    if args.compact:
+        print(f"\nLoading building blocks for reverse engineering from '{args.bb_glob}'...")
+        bb_mapper = BuildingBlockMapper(bb_files_glob=args.bb_glob)
+        if len(bb_mapper.bb_map) == 0:
+            print("⚠️ Warning: No building blocks mapped for reverse-engineering. Ensure --bb-glob is correct.")
+        else:
+            print(f"✔ Successfully loaded {len(bb_mapper.bb_map):,} building blocks for reverse engineering.")
+            
     # 3. Create Dataset and DataLoader
     try:
         dataset = InferenceDataset(
             filepath=args.validation_file,
             protein_sequence=pgk2_sequence,
             tokenizer_op=tokenizer_op,
+            bb_mapper=bb_mapper,
+            compact=args.compact,
             id_column=args.id_col,
             smiles_column=args.smiles_col
         )

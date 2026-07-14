@@ -190,6 +190,7 @@ class BuildingBlockMapper:
         e.g., 'OpenDEL-libraries/building_blocks/*.parquet'
         """
         self.bb_map = {}
+        self.bb_cycle_maps = {1: {}, 2: {}, 3: {}}
         bb_files = glob.glob(bb_files_glob)
         if not bb_files:
             warnings.warn(f"No building block files found matching {bb_files_glob}")
@@ -203,12 +204,28 @@ class BuildingBlockMapper:
                 id_col = [c for c in bb_df.columns if c.lower() in ("id", "bb_id", "bb_name")][0]
                 smiles_col = [c for c in bb_df.columns if c.lower() in ("smiles", "structure")][0]
                 
+                # Determine cycle from filename/path
+                filename = os.path.basename(file).lower()
+                cycle = None
+                if "bb1" in filename or "cycle1" in filename:
+                    cycle = 1
+                elif "bb2" in filename or "cycle2" in filename:
+                    cycle = 2
+                elif "bb3" in filename or "cycle3" in filename:
+                    cycle = 3
+                
                 for row in bb_df.select([id_col, smiles_col]).iter_rows():
-                    self.bb_map[str(row[0])] = str(row[1])
+                    bb_id_str = str(row[0])
+                    smiles_str = str(row[1])
+                    self.bb_map[bb_id_str] = smiles_str
+                    if cycle is not None:
+                        self.bb_cycle_maps[cycle][bb_id_str] = smiles_str
             except Exception as e:
                 print(f"Error loading {file}: {e}")
                 
         print(f"Loaded {len(self.bb_map):,} unique building block mappings.")
+        for cycle_idx, cycle_map in self.bb_cycle_maps.items():
+            print(f"  Cycle {cycle_idx}: {len(cycle_map):,} building blocks mapped.")
 
     def get_bb_smiles(self, compound_id: str) -> list[str]:
         """
@@ -223,6 +240,132 @@ class BuildingBlockMapper:
         except Exception:
             return ["", "", ""]
 
+    def _init_reverse_engineering(self) -> None:
+        """Initialize and cache fingerprints for building blocks to speed up reverse engineering."""
+        if hasattr(self, "_re_initialized") and self._re_initialized:
+            return
+            
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+        except ImportError:
+            raise ImportError(
+                "RDKit is required for building block reverse-engineering. "
+                "Please run `pip install rdkit` to install it."
+            )
+            
+        print("Initializing building block fingerprint cache for reverse engineering...")
+        self.bb_mols = {}
+        self.bb_fps = {}
+        
+        for bb_id, smiles in self.bb_map.items():
+            if not smiles:
+                continue
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    self.bb_mols[bb_id] = mol
+                    self.bb_fps[bb_id] = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+            except Exception:
+                pass
+                
+        self._re_initialized = True
+        print(f"Cached fingerprints for {len(self.bb_fps)} building blocks.")
+
+    def reverse_engineer_smiles(self, query_smiles: str) -> tuple[list[str], list[str]]:
+        """
+        Decompose a full molecule SMILES (e.g., from validation set) into 
+        the 3 closest building blocks from our library.
+        
+        Returns:
+            bb_smiles: list of 3 SMILES strings
+            bb_codes: list of 3 building block IDs
+        """
+        self._init_reverse_engineering()
+        
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, DataStructs
+        
+        query_mol = Chem.MolFromSmiles(query_smiles)
+        if query_mol is None:
+            return ["", "", ""], ["", "", ""]
+            
+        query_fp = AllChem.GetMorganFingerprintAsBitVect(query_mol, 2, nBits=2048)
+        
+        bb_smiles = ["", "", ""]
+        bb_codes = ["", "", ""]
+        
+        # Check if we have cycle-specific building blocks mapped
+        has_cycles = all(len(self.bb_cycle_maps[i]) > 0 for i in (1, 2, 3))
+        
+        if has_cycles:
+            # For each cycle (1, 2, 3), find the best matching building block
+            for cycle_idx in (1, 2, 3):
+                candidates = self.bb_cycle_maps[cycle_idx]
+                best_id = ""
+                best_score = -1.0
+                
+                for bb_id, bb_sm in candidates.items():
+                    if bb_id not in self.bb_fps:
+                        continue
+                        
+                    bb_mol = self.bb_mols[bb_id]
+                    bb_fp = self.bb_fps[bb_id]
+                    
+                    # 1. Substructure check (highest priority match)
+                    try:
+                        has_match = query_mol.HasSubstructMatch(bb_mol)
+                    except Exception:
+                        has_match = False
+                        
+                    # 2. Tversky similarity for sub-fingerprint match
+                    try:
+                        sim = DataStructs.TverskySimilarity(bb_fp, query_fp, 0.0, 1.0)
+                    except Exception:
+                        sim = 0.0
+                        
+                    # Combine scores: substructure matches get boosted
+                    score = 1.0 + sim if has_match else sim
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_id = bb_id
+                        
+                if best_id:
+                    bb_codes[cycle_idx - 1] = best_id
+                    bb_smiles[cycle_idx - 1] = candidates[best_id]
+        else:
+            # Fallback flat lookup: find top 3 overall matches
+            all_scores = []
+            for bb_id, bb_sm in self.bb_map.items():
+                if bb_id not in self.bb_fps:
+                    continue
+                    
+                bb_mol = self.bb_mols[bb_id]
+                bb_fp = self.bb_fps[bb_id]
+                
+                try:
+                    has_match = query_mol.HasSubstructMatch(bb_mol)
+                except Exception:
+                    has_match = False
+                    
+                try:
+                    sim = DataStructs.TverskySimilarity(bb_fp, query_fp, 0.0, 1.0)
+                except Exception:
+                    sim = 0.0
+                    
+                score = 1.0 + sim if has_match else sim
+                all_scores.append((score, bb_id, bb_sm))
+                
+            all_scores.sort(key=lambda x: x[0], reverse=True)
+            top_3 = all_scores[:3]
+            for idx, (score, bb_id, bb_sm) in enumerate(top_3):
+                if idx < 3:
+                    bb_codes[idx] = bb_id
+                    bb_smiles[idx] = bb_sm
+                    
+        return bb_smiles, bb_codes
+
 # ---------------------------------------------------------------------------
 # 4. Multi-Modal MAMMAL Prompt Encoder
 # ---------------------------------------------------------------------------
@@ -231,6 +374,8 @@ def construct_mammal_prompt(
     protein_sequence: str,
     bb_smiles: list[str],
     compound_smiles: str,
+    bb_codes: list[str] | None = None,
+    compact: bool = False,
 ) -> str:
     """
     Format combinatorial building blocks, final compound SMILES, and target protein
@@ -251,11 +396,21 @@ def construct_mammal_prompt(
             f"<SEQUENCE_NATURAL_START>{bbs_combined}<SEQUENCE_NATURAL_END>"
         )
         
-    # 3. Holistic Compound SMILES
-    compound_part = (
-        f"<@TOKENIZER-TYPE=SMILES><MOLECULAR_ENTITY><MOLECULAR_ENTITY_SMALL_MOLECULE>"
-        f"<SEQUENCE_NATURAL_START>{compound_smiles}<SEQUENCE_NATURAL_END>"
-    )
+    if compact:
+        # 3. BB codes representation instead of holistic compound SMILES
+        if bb_codes is None:
+            bb_codes = ["", "", ""]
+        bb_codes_str = "-".join([str(c) for c in bb_codes if c])
+        compound_part = (
+            f"<@TOKENIZER-TYPE=SMILES><MOLECULAR_ENTITY><MOLECULAR_ENTITY_SMALL_MOLECULE>"
+            f"<SEQUENCE_NATURAL_START>{bb_codes_str}<SEQUENCE_NATURAL_END>"
+        )
+    else:
+        # 3. Holistic Compound SMILES
+        compound_part = (
+            f"<@TOKENIZER-TYPE=SMILES><MOLECULAR_ENTITY><MOLECULAR_ENTITY_SMALL_MOLECULE>"
+            f"<SEQUENCE_NATURAL_START>{compound_smiles}<SEQUENCE_NATURAL_END>"
+        )
     
     return f"{protein_part}{bb_part}{compound_part}<EOS>"
 
@@ -279,11 +434,13 @@ class LargeMAMMALDataset(Dataset):
         score_threshold_labeling: float = 0.5,
         sample_size: int | None = None,
         random_seed: int = 42,
+        compact: bool = False,
         **scoring_kwargs,
     ) -> None:
         self.bb_mapper = bb_mapper
         self.protein_sequence = protein_sequence
         self.tokenizer_op = tokenizer_op
+        self.compact = compact
         
         # Load and compute customizable targets
         df = pd.read_parquet(selection_parquet_path)
@@ -321,11 +478,17 @@ class LargeMAMMALDataset(Dataset):
         # Combinatorial building-block lookup
         bb_smiles = self.bb_mapper.get_bb_smiles(compound_id)
         
+        # Extract BB codes
+        parts = str(compound_id).split("-")
+        bb_codes = parts[1:4] if len(parts) >= 4 else ["", "", ""]
+        
         # Construct unified prompt string
         prompt_str = construct_mammal_prompt(
             protein_sequence=self.protein_sequence,
             bb_smiles=bb_smiles,
-            compound_smiles=compound_smiles
+            compound_smiles=compound_smiles,
+            bb_codes=bb_codes,
+            compact=self.compact
         )
         
         # Prepare MAMMAL tokenized format dict
