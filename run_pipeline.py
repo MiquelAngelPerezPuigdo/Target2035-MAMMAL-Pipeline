@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scoring-scheme",
         type=str,
-        choices=["tier1", "tier2", "tier3"],
+        choices=["tier2"],
         default="tier2",
         help="The scoring scheme to map 3 experimental conditions into a 0-1 target score."
     )
